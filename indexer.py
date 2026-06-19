@@ -27,6 +27,7 @@ import storage
 TOC_CHECK_PAGES = 20             # how many initial pages to scan for a table of contents
 MAX_CHAPTERS = 30                # safety cap
 CHAPTER_TEXT_CHARS_FOR_SUMMARY = 9000  # how much of a chapter to show the LLM when summarizing
+FALLBACK_CHUNK_PAGES = 8         # page-range size used when no numbered chapter structure is found
 
 llm = ChatMistralAI(model="mistral-small-2603")
 
@@ -101,51 +102,11 @@ Return ONLY valid JSON in exactly this shape, no markdown fences:
     return _llm_json(prompt)
 
 
-def index_pdf(file_bytes, original_name, on_progress=None):
-    """
-    Build (or reuse) the PageIndex tree for one PDF.
-
-    file_bytes:    raw bytes of the uploaded PDF
-    original_name: the filename the user uploaded, kept for display
-    on_progress:   optional callback(str) used to report status while
-                   indexing -- the Streamlit app uses this to show a
-                   live "what's happening right now" message
-
-    Returns the document's meta dict (see storage.make_meta). If this
-    exact file was already indexed before, the existing result is
-    reused instead of calling the LLM again.
-    """
-    def report(msg):
-        if on_progress:
-            on_progress(msg)
-
-    doc_id = storage.make_doc_id(file_bytes)
-    if storage.doc_exists(doc_id):
-        report(f"'{original_name}' is already in your library -- skipping re-indexing")
-        return storage.load_meta(doc_id)
-
-    report("Reading PDF pages ...")
-    pages = load_pdf_pages(io.BytesIO(file_bytes))
-
-    report("Extracting the table-of-contents structure ...")
-    toc = _extract_toc_structure(pages)
-    chapters = toc.get("chapters", [])[:MAX_CHAPTERS]
-
-    report("Locating chapter and section page numbers ...")
-    located_chapters = []  # list of (chapter_dict, start_page_idx)
-    search_from = 0
-    for ch in chapters:
-        start_idx = find_chapter_page(pages, ch["number"], search_from)
-        if start_idx is None:
-            continue
-        located_chapters.append((ch, start_idx))
-        search_from = start_idx + 1
-
-    # Node ids only need to be unique within THIS document's tree, so a
-    # counter local to this call (instead of module-level global state)
-    # keeps indexing of one PDF from ever bleeding into another's ids.
-    node_id_gen = (f"{n:04d}" for n in itertools.count(1))
-
+def _build_chapter_tree(pages, located_chapters, node_id_gen, report):
+    """Build the tree from a successfully detected numbered chapter/section
+    structure -- this is the original chapter-wise logic, just pulled out
+    into its own function so index_pdf() can choose between this and the
+    fallback path below."""
     tree = []
     for i, (ch, start_idx) in enumerate(located_chapters):
         end_idx = (located_chapters[i + 1][1] - 1) if i + 1 < len(located_chapters) else len(pages) - 1
@@ -190,10 +151,122 @@ def index_pdf(file_bytes, original_name, on_progress=None):
             "summary": summaries.get("chapter_summary", ""),
             "nodes": section_nodes,
         })
+    return tree
+
+
+def _build_fallback_tree(pages, node_id_gen, report, chunk_size=FALLBACK_CHUNK_PAGES):
+    """
+    Used whenever no numbered chapter/TOC structure could be detected --
+    resumes, contracts, research papers, articles, slide decks, or any PDF
+    that simply doesn't lay itself out as "Chapter 1", "Chapter 2", etc.
+
+    Instead of giving up (which previously meant an empty tree and every
+    question answered with "I could not find the answer"), this splits the
+    document into fixed-size page ranges and treats each range as a flat,
+    top-level section node -- same shape as a chapter node from
+    _build_chapter_tree, just without nested sub-sections -- so
+    retriever.py's tree search works identically no matter which path
+    built the tree.
+    """
+    tree = []
+    total_pages = len(pages)
+    for chunk_start in range(0, total_pages, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, total_pages) - 1
+        chunk_text = "\n".join(pages[chunk_start:chunk_end + 1])
+        if not chunk_text.strip():
+            continue  # skip chunks that are blank/empty (e.g. trailing blank pages)
+
+        title = f"Pages {chunk_start + 1}-{chunk_end + 1}"
+        report(f"Summarizing {title} ...")
+        try:
+            summary = _summarize_chapter(title, [], chunk_text)
+            chapter_summary = summary.get("chapter_summary", "")
+        except Exception:
+            chapter_summary = ""
+
+        tree.append({
+            "node_id": next(node_id_gen),
+            "title": title,
+            "level": 1,
+            "start_index": chunk_start + 1,
+            "end_index": chunk_end + 1,
+            "summary": chapter_summary,
+            "nodes": [],
+        })
+    return tree
+
+
+def index_pdf(file_bytes, original_name, on_progress=None):
+    """
+    Build (or reuse) the PageIndex tree for one PDF.
+
+    file_bytes:    raw bytes of the uploaded PDF
+    original_name: the filename the user uploaded, kept for display
+    on_progress:   optional callback(str) used to report status while
+                   indexing -- the Streamlit app uses this to show a
+                   live "what's happening right now" message
+
+    Returns the document's meta dict (see storage.make_meta). If this
+    exact file was already indexed before, the existing result is
+    reused instead of calling the LLM again.
+
+    Two indexing strategies are tried, in order:
+      1. Numbered-chapter structure (original behaviour) -- works well
+         for books/textbooks with a real "Chapter 1, Chapter 2, ..." TOC.
+      2. Fallback page-range chunking -- used automatically whenever step 1
+         finds zero chapters (e.g. the PDF has no TOC, or doesn't number
+         its chapters/headings the way step 1 expects), so that EVERY PDF
+         ends up with a non-empty, searchable tree instead of silently
+         producing an empty index.
+    """
+    def report(msg):
+        if on_progress:
+            on_progress(msg)
+
+    doc_id = storage.make_doc_id(file_bytes)
+    if storage.doc_exists(doc_id):
+        report(f"'{original_name}' is already in your library -- skipping re-indexing")
+        return storage.load_meta(doc_id)
+
+    report("Reading PDF pages ...")
+    pages = load_pdf_pages(io.BytesIO(file_bytes))
+
+    report("Extracting the table-of-contents structure ...")
+    try:
+        toc = _extract_toc_structure(pages)
+        chapters = toc.get("chapters", [])[:MAX_CHAPTERS]
+    except Exception:
+        # LLM returned something we couldn't parse as JSON, or this PDF
+        # simply has no recognizable TOC -- fall back below instead of
+        # crashing the whole indexing run.
+        chapters = []
+
+    report("Locating chapter and section page numbers ...")
+    located_chapters = []  # list of (chapter_dict, start_page_idx)
+    search_from = 0
+    for ch in chapters:
+        start_idx = find_chapter_page(pages, ch["number"], search_from)
+        if start_idx is None:
+            continue
+        located_chapters.append((ch, start_idx))
+        search_from = start_idx + 1
+
+    # Node ids only need to be unique within THIS document's tree, so a
+    # counter local to this call (instead of module-level global state)
+    # keeps indexing of one PDF from ever bleeding into another's ids.
+    node_id_gen = (f"{n:04d}" for n in itertools.count(1))
+
+    if located_chapters:
+        report(f"Found {len(located_chapters)} numbered chapter(s) -- building chapter/section tree ...")
+        tree = _build_chapter_tree(pages, located_chapters, node_id_gen, report)
+    else:
+        report("No numbered chapter structure detected in this PDF -- "
+                "falling back to page-range sections so it can still be searched ...")
+        tree = _build_fallback_tree(pages, node_id_gen, report)
 
     meta = storage.make_meta(doc_id, original_name, num_pages=len(pages), num_chapters=len(tree))
     pages_by_number = {str(i + 1): pages[i] for i in range(len(pages))}
     storage.save_document(doc_id, meta, {"doc": original_name, "nodes": tree}, pages_by_number)
 
-    report(f"Done -- indexed {len(tree)} chapter(s) from {len(pages)} pages")
+    report(f"Done -- indexed {len(tree)} section(s) from {len(pages)} pages")
     return meta
